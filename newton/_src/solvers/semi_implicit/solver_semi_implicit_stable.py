@@ -422,6 +422,58 @@ def implicit_joint_forces(
 
 
 # ---------------------------------------------------------------------------
+# Re-integrate body positions from corrected velocities
+# ---------------------------------------------------------------------------
+
+@wp.kernel
+def reintegrate_body_positions(
+    body_q_old: wp.array(dtype=wp.transform),       # pre-integration positions
+    body_qd_corrected: wp.array(dtype=wp.spatial_vector),  # post-correction velocities
+    body_com: wp.array(dtype=wp.vec3),
+    body_inv_mass: wp.array(dtype=float),
+    dt: float,
+    body_q_out: wp.array(dtype=wp.transform),       # output: corrected positions
+):
+    """Re-integrate body positions using corrected velocities.
+
+    After ``implicit_joint_forces`` corrects ``body_qd``, the positions in
+    ``body_q`` are stale (computed from pre-correction velocities).  This
+    kernel recomputes ``x_new = x_com_old + v_corrected * dt`` and
+    ``r_new = normalize(r_old + quat(w_corrected) * r_old * 0.5 * dt)``
+    to restore position-velocity consistency.
+
+    Launched with ``dim = model.body_count``.
+    """
+    tid = wp.tid()
+
+    inv_mass = body_inv_mass[tid]
+
+    # Skip fixed bodies (inv_mass == 0)
+    if inv_mass == 0.0:
+        return
+
+    q_old = body_q_old[tid]
+    x0 = wp.transform_get_translation(q_old)
+    r0 = wp.transform_get_rotation(q_old)
+    com = body_com[tid]
+
+    # COM position before integration
+    x_com = x0 + wp.quat_rotate(r0, com)
+
+    # Corrected velocities (what will be state_in.body_qd next substep)
+    qd = body_qd_corrected[tid]
+    v1 = wp.spatial_top(qd)
+    w1 = wp.spatial_bottom(qd)
+
+    # Re-integrate position using corrected velocity (semi-implicit Euler)
+    x1 = x_com + v1 * dt
+    r1 = wp.normalize(r0 + wp.quat(w1, 0.0) * r0 * 0.5 * dt)
+
+    # Store as transform (body origin = COM position - rotated COM offset)
+    body_q_out[tid] = wp.transform(x1 - wp.quat_rotate(r1, com), r1)
+
+
+# ---------------------------------------------------------------------------
 # Solver class
 # ---------------------------------------------------------------------------
 
@@ -557,5 +609,21 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                         self.joint_attach_kd,
                         dt,
                     ],
+                    device=model.device,
+                )
+
+            # --- Re-integrate positions from corrected velocities ---
+            if model.body_count:
+                wp.launch(
+                    kernel=reintegrate_body_positions,
+                    dim=model.body_count,
+                    inputs=[
+                        state_in.body_q,
+                        state_out.body_qd,
+                        model.body_com,
+                        model.body_inv_mass,
+                        dt,
+                    ],
+                    outputs=[state_out.body_q],
                     device=model.device,
                 )
