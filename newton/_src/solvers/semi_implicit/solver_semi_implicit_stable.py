@@ -228,10 +228,6 @@ def implicit_joint_forces(
     delta_v_c = wp.vec3()
     delta_w_c = wp.vec3()
 
-    # Accumulated corrections for parent body
-    delta_v_p = wp.vec3()
-    delta_w_p = wp.vec3()
-
     m_c = body_mass[c_child]
     I_c = body_inertia[c_child]
     I_eff_c = wp.max(wp.min(I_c[0, 0], wp.min(I_c[1, 1], I_c[2, 2])), 1.0e-12)
@@ -394,31 +390,15 @@ def implicit_joint_forces(
         delta_w_c += total_t * (dt / ang_denom)
 
     # ---------------------------------------------------------------
-    # Apply corrections to child body
+    # Apply corrections to child body only
     # ---------------------------------------------------------------
+    # Parent corrections are omitted: when a heavy child (e.g. torso,
+    # I=0.034) is connected to a light parent (e.g. waist_roll, I=4e-6),
+    # any inertia-ratio scaling amplifies corrections by 1000x+, causing
+    # immediate blowup.  Correcting only the child body is standard in
+    # position-based dynamics — the parent serves as the reference frame.
     if m_c > 0.0:
         wp.atomic_sub(body_qd, c_child, wp.spatial_vector(delta_v_c, delta_w_c))
-
-    # ---------------------------------------------------------------
-    # Apply equal-and-opposite corrections to parent body
-    # ---------------------------------------------------------------
-    if c_parent >= 0:
-        m_p = body_mass[c_parent]
-        if m_p > 0.0:
-            I_p = body_inertia[c_parent]
-            I_eff_p = wp.max(wp.min(I_p[0, 0], wp.min(I_p[1, 1], I_p[2, 2])), 1.0e-12)
-
-            # Recompute corrections with parent mass/inertia
-            # Linear: same force, different mass
-            # For simplicity, scale by mass ratio
-            parent_delta_v = delta_v_c * (m_c / m_p)
-
-            # Angular: same torque, different inertia
-            parent_delta_w = delta_w_c * (I_eff_c / I_eff_p)
-
-            wp.atomic_add(
-                body_qd, c_parent, wp.spatial_vector(parent_delta_v, parent_delta_w)
-            )
 
 
 # ---------------------------------------------------------------------------
