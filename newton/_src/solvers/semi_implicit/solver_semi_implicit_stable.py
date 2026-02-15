@@ -52,6 +52,7 @@ from .kernels_particle import (
     eval_tetrahedra_forces,
     eval_triangle_forces,
 )
+from ..solver import integrate_bodies as _integrate_bodies_kernel
 from .solver_semi_implicit import SolverSemiImplicit
 
 
@@ -507,6 +508,12 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
         super().__init__(model, **kwargs)
         self._debug = False
         self._debug_qd_buf = None
+        # Intermediate buffer for body_q after integration but before
+        # reintegration.  Using a separate buffer prevents state_out.body_q
+        # from being written twice per substep (once by integrate_bodies,
+        # once by reintegrate_body_positions), which would cause the tape
+        # to double-count gradients (factor 2× per substep → 2^N blowup).
+        self._body_q_integrated = None
 
     @override
     def step(
@@ -579,9 +586,40 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                 model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=False
             )
 
-            # --- Integration (same as parent) ---
+            # --- Integration ---
             self.integrate_particles(model, state_in, state_out, dt)
-            self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
+
+            # Integrate bodies into an INTERMEDIATE buffer for body_q.
+            # state_out.body_qd gets the integrated velocity directly.
+            # We must NOT write body_q to state_out yet — that would cause
+            # a double-write (integrate + reintegrate), breaking tape gradients
+            # (2× amplification per substep → 2^N gradient blowup).
+            if model.body_count:
+                if self._body_q_integrated is None or self._body_q_integrated.shape[0] != model.body_count:
+                    self._body_q_integrated = wp.zeros(
+                        model.body_count, dtype=wp.transform, device=model.device,
+                        requires_grad=state_out.body_q.requires_grad,
+                    )
+                wp.launch(
+                    kernel=_integrate_bodies_kernel,
+                    dim=model.body_count,
+                    inputs=[
+                        state_in.body_q,
+                        state_in.body_qd,
+                        state_in.body_f,
+                        model.body_com,
+                        model.body_mass,
+                        model.body_inertia,
+                        model.body_inv_mass,
+                        model.body_inv_inertia,
+                        model.body_world,
+                        model.gravity,
+                        self.angular_damping,
+                        dt,
+                    ],
+                    outputs=[self._body_q_integrated, state_out.body_qd],
+                    device=model.device,
+                )
 
             # --- Save pre-correction state for debugging ---
             if self._debug:
@@ -590,12 +628,14 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                 wp.copy(self._debug_qd_buf, state_out.body_qd)
 
             # --- Implicit joint force correction (ALL joint forces) ---
+            # Reads from _body_q_integrated (intermediate positions) to
+            # compute joint errors, corrects state_out.body_qd in-place.
             if model.joint_count:
                 wp.launch(
                     kernel=implicit_joint_forces,
                     dim=model.joint_count,
                     inputs=[
-                        state_out.body_q,
+                        self._body_q_integrated,
                         state_out.body_qd,
                         model.body_com,
                         model.body_mass,
@@ -625,6 +665,8 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                 )
 
             # --- Re-integrate positions from corrected velocities ---
+            # This is the ONLY write to state_out.body_q, ensuring clean
+            # gradient flow through the tape.
             if model.body_count:
                 wp.launch(
                     kernel=reintegrate_body_positions,
