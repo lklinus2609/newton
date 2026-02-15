@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from .solver_semi_implicit import SolverSemiImplicit
+from .solver_semi_implicit_stable import SolverSemiImplicitStable
 
 __all__ = [
     "SolverSemiImplicit",
+    "SolverSemiImplicitStable",
 ]
