@@ -97,6 +97,30 @@ def apply_free_joint_wrench(
 # ---------------------------------------------------------------------------
 
 @wp.func
+def implicit_angular_correction(
+    torque_world: wp.vec3,
+    r_child: wp.quat,
+    I_diag: wp.vec3,
+    c: float,
+    dt: float,
+) -> wp.vec3:
+    """Per-axis implicit angular velocity correction in body frame.
+
+    Rotates the world-frame torque into the child body frame, divides each
+    axis by its own ``(I_ii + c)`` denominator, and rotates back.  This avoids
+    the overcorrection that happens when a scalar ``I_min`` is used for
+    bodies with anisotropic inertia tensors (e.g. torso I_ratio = 8.6x).
+    """
+    tb = wp.quat_rotate_inv(r_child, torque_world)
+    dw_body = wp.vec3(
+        dt * tb[0] / (I_diag[0] + c),
+        dt * tb[1] / (I_diag[1] + c),
+        dt * tb[2] / (I_diag[2] + c),
+    )
+    return wp.quat_rotate(r_child, dw_body)
+
+
+@wp.func
 def implicit_joint_force(
     q: float,
     qd: float,
@@ -230,7 +254,12 @@ def implicit_joint_forces(
 
     m_c = body_mass[c_child]
     I_c = body_inertia[c_child]
-    I_eff_c = wp.max(wp.min(I_c[0, 0], wp.min(I_c[1, 1], I_c[2, 2])), 1.0e-12)
+    I_diag_c = wp.vec3(
+        wp.max(I_c[0, 0], 1.0e-12),
+        wp.max(I_c[1, 1], 1.0e-12),
+        wp.max(I_c[2, 2], 1.0e-12),
+    )
+    r_child = wp.transform_get_rotation(body_q[c_child])
 
     if type == int(JointType.REVOLUTE):
         axis = joint_axis[qd_start]
@@ -264,10 +293,11 @@ def implicit_joint_forces(
         # Include user wrench
         tau_axis = -joint_f[qd_start] - tau_pd
 
-        # Implicit correction along joint axis
-        axis_denom = I_eff_c + dt * dt * eff_ke + dt * eff_kd
-        delta_w_axis = dt * tau_axis / axis_denom
-        delta_w_c += axis_p * delta_w_axis
+        # Implicit correction along joint axis (per-axis)
+        c_pd = dt * dt * eff_ke + dt * eff_kd
+        delta_w_c += implicit_angular_correction(
+            axis_p * tau_axis, r_child, I_diag_c, c_pd, dt
+        )
 
         # --- Attachment forces (implicit) ---
         # Linear attachment
@@ -276,20 +306,17 @@ def implicit_joint_forces(
         if m_c > 0.0:
             delta_v_c += f_attach * (dt / lin_denom)
 
-        # Angular attachment (off-axis swing)
+        # Angular attachment (off-axis swing + moment-arm coupling)
         swing_err = wp.cross(axis_p, axis_c)
         t_attach = (
             swing_err * joint_attach_ke
             + (w_err - qd_val * axis_p) * joint_attach_kd * angular_damping_scale
         )
-        # Moment-arm coupling from linear force
         total_t_attach = t_attach + wp.cross(r_c, f_attach)
-        ang_attach_denom = (
-            I_eff_c
-            + dt * dt * joint_attach_ke
-            + dt * joint_attach_kd * angular_damping_scale
+        c_attach = dt * dt * joint_attach_ke + dt * joint_attach_kd * angular_damping_scale
+        delta_w_c += implicit_angular_correction(
+            total_t_attach, r_child, I_diag_c, c_attach, dt
         )
-        delta_w_c += total_t_attach * (dt / ang_attach_denom)
 
     elif type == int(JointType.FIXED):
         # FIXED joints: all DOFs constrained by attachment
@@ -310,12 +337,10 @@ def implicit_joint_forces(
             delta_v_c += f_attach * (dt / lin_denom)
 
         total_t = t_attach + wp.cross(r_c, f_attach)
-        ang_denom = (
-            I_eff_c
-            + dt * dt * joint_attach_ke
-            + dt * joint_attach_kd * angular_damping_scale
+        c_fixed = dt * dt * joint_attach_ke + dt * joint_attach_kd * angular_damping_scale
+        delta_w_c += implicit_angular_correction(
+            total_t, r_child, I_diag_c, c_fixed, dt
         )
-        delta_w_c += total_t * (dt / ang_denom)
 
     elif type == int(JointType.BALL):
         # BALL joints: linear attachment only, angular DOFs are free
@@ -325,12 +350,10 @@ def implicit_joint_forces(
             delta_v_c += f_attach * (dt / lin_denom)
             # Moment-arm coupling
             total_t = wp.cross(r_c, f_attach)
-            ang_denom = (
-                I_eff_c
-                + dt * dt * joint_attach_ke
-                + dt * joint_attach_kd
+            c_ball = dt * dt * joint_attach_ke + dt * joint_attach_kd
+            delta_w_c += implicit_angular_correction(
+                total_t, r_child, I_diag_c, c_ball, dt
             )
-            delta_w_c += total_t * (dt / ang_denom)
 
     elif type == int(JointType.PRISMATIC):
         axis = joint_axis[qd_start]
@@ -382,12 +405,10 @@ def implicit_joint_forces(
             delta_v_c += f_attach * (dt / lin_attach_denom)
 
         total_t = t_attach + wp.cross(r_c, f_attach)
-        ang_denom = (
-            I_eff_c
-            + dt * dt * joint_attach_ke
-            + dt * joint_attach_kd * angular_damping_scale
+        c_prism = dt * dt * joint_attach_ke + dt * joint_attach_kd * angular_damping_scale
+        delta_w_c += implicit_angular_correction(
+            total_t, r_child, I_diag_c, c_prism, dt
         )
-        delta_w_c += total_t * (dt / ang_denom)
 
     # ---------------------------------------------------------------
     # Apply corrections to child body only
