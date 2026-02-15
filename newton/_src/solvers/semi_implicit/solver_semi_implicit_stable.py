@@ -513,6 +513,12 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
         # from being written twice per substep (once by integrate_bodies,
         # once by reintegrate_body_positions), which would cause the tape
         # to double-count gradients (factor 2× per substep → 2^N blowup).
+        #
+        # IMPORTANT: When requires_grad=True, a FRESH buffer must be
+        # allocated on every step() call.  Reusing a single buffer causes
+        # the tape to see the LAST substep's values for ALL substeps on
+        # backward, producing wrong gradients for non-root joints.
+        # The cached buffer is only used when requires_grad=False.
         self._body_q_integrated = None
 
     @override
@@ -595,11 +601,24 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
             # a double-write (integrate + reintegrate), breaking tape gradients
             # (2× amplification per substep → 2^N gradient blowup).
             if model.body_count:
-                if self._body_q_integrated is None or self._body_q_integrated.shape[0] != model.body_count:
-                    self._body_q_integrated = wp.zeros(
-                        model.body_count, dtype=wp.transform, device=model.device,
-                        requires_grad=state_out.body_q.requires_grad,
+                if state_out.body_q.requires_grad:
+                    # MUST allocate a fresh buffer each step() so the tape
+                    # preserves each substep's values for the backward pass.
+                    # Reusing one buffer makes all substeps see the last
+                    # substep's values, breaking gradients for non-root joints.
+                    body_q_integrated = wp.zeros(
+                        model.body_count, dtype=wp.transform,
+                        device=model.device, requires_grad=True,
                     )
+                else:
+                    # No gradients — safe to reuse a single buffer.
+                    if self._body_q_integrated is None or self._body_q_integrated.shape[0] != model.body_count:
+                        self._body_q_integrated = wp.zeros(
+                            model.body_count, dtype=wp.transform,
+                            device=model.device, requires_grad=False,
+                        )
+                    body_q_integrated = self._body_q_integrated
+
                 wp.launch(
                     kernel=_integrate_bodies_kernel,
                     dim=model.body_count,
@@ -617,7 +636,7 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                         self.angular_damping,
                         dt,
                     ],
-                    outputs=[self._body_q_integrated, state_out.body_qd],
+                    outputs=[body_q_integrated, state_out.body_qd],
                     device=model.device,
                 )
 
@@ -628,14 +647,14 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
                 wp.copy(self._debug_qd_buf, state_out.body_qd)
 
             # --- Implicit joint force correction (ALL joint forces) ---
-            # Reads from _body_q_integrated (intermediate positions) to
+            # Reads from body_q_integrated (intermediate positions) to
             # compute joint errors, corrects state_out.body_qd in-place.
             if model.joint_count:
                 wp.launch(
                     kernel=implicit_joint_forces,
                     dim=model.joint_count,
                     inputs=[
-                        self._body_q_integrated,
+                        body_q_integrated,
                         state_out.body_qd,
                         model.body_com,
                         model.body_mass,
