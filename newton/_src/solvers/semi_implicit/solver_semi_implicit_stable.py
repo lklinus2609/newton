@@ -502,6 +502,11 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
             state_in, state_out = state_out, state_in
     """
 
+    def __init__(self, model: Model, **kwargs):
+        super().__init__(model, **kwargs)
+        self._debug = False
+        self._debug_qd_buf = None
+
     @override
     def step(
         self,
@@ -576,6 +581,12 @@ class SolverSemiImplicitStable(SolverSemiImplicit):
             # --- Integration (same as parent) ---
             self.integrate_particles(model, state_in, state_out, dt)
             self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
+
+            # --- Save pre-correction state for debugging ---
+            if self._debug:
+                if self._debug_qd_buf is None:
+                    self._debug_qd_buf = wp.zeros_like(state_out.body_qd)
+                wp.copy(self._debug_qd_buf, state_out.body_qd)
 
             # --- Implicit joint force correction (ALL joint forces) ---
             if model.joint_count:
